@@ -19,6 +19,7 @@ export class CameraController {
 
   private keys = new Set<string>();
   public enabled = true;
+  public allowSingleTouchOrbit = true;
 
   private dragMode: 'none' | 'orbit' | 'pan' = 'none';
   private lastPointerX = 0;
@@ -30,6 +31,11 @@ export class CameraController {
   private lastPinchDist = 0;
   private lastPinchMidX = 0;
   private lastPinchMidY = 0;
+  private touchOrbitPointerId: number | null = null;
+  private touchStartX = 0;
+  private touchStartY = 0;
+  private touchOrbitActivated = false;
+  private hadMultiTouch = false;
 
   constructor(camera: THREE.PerspectiveCamera, domElement: HTMLElement) {
     this.camera = camera;
@@ -43,15 +49,34 @@ export class CameraController {
 
     this.domElement.addEventListener('pointerdown', (e) => {
       if (!this.enabled) return;
-      this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-      if (this.activePointers.size === 2) {
-        // Two-finger touch pinch & pan
-        const pts = Array.from(this.activePointers.values());
-        this.lastPinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
-        this.lastPinchMidX = (pts[0].x + pts[1].x) * 0.5;
-        this.lastPinchMidY = (pts[0].y + pts[1].y) * 0.5;
-        this.dragMode = 'none';
+      if (e.pointerType === 'touch') {
+        this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+        if (this.activePointers.size === 1) {
+          this.touchOrbitPointerId = e.pointerId;
+          this.touchStartX = e.clientX;
+          this.touchStartY = e.clientY;
+          this.lastPointerX = e.clientX;
+          this.lastPointerY = e.clientY;
+          this.touchOrbitActivated = false;
+          this.hadMultiTouch = false;
+          this.movedDuringDrag = false;
+          this.dragMode = 'none';
+        } else if (this.activePointers.size === 2) {
+          // Two-finger touch pinch & pan
+          this.hadMultiTouch = true;
+          this.touchOrbitActivated = false;
+          this.dragMode = 'none';
+          const pts = Array.from(this.activePointers.values());
+          this.lastPinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+          this.lastPinchMidX = (pts[0].x + pts[1].x) * 0.5;
+          this.lastPinchMidY = (pts[0].y + pts[1].y) * 0.5;
+        } else {
+          this.hadMultiTouch = true;
+          this.touchOrbitActivated = false;
+          this.dragMode = 'none';
+        }
         return;
       }
 
@@ -71,24 +96,50 @@ export class CameraController {
 
     window.addEventListener('pointermove', (e) => {
       if (!this.enabled) return;
-      if (this.activePointers.has(e.pointerId)) {
+
+      if (e.pointerType === 'touch') {
+        if (!this.activePointers.has(e.pointerId)) return;
         this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      }
 
-      if (this.activePointers.size === 2) {
-        const pts = Array.from(this.activePointers.values());
-        const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
-        const midX = (pts[0].x + pts[1].x) * 0.5;
-        const midY = (pts[0].y + pts[1].y) * 0.5;
+        if (this.activePointers.size === 2) {
+          const pts = Array.from(this.activePointers.values());
+          const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+          const midX = (pts[0].x + pts[1].x) * 0.5;
+          const midY = (pts[0].y + pts[1].y) * 0.5;
 
-        if (this.lastPinchDist > 1) {
-          const factor = this.lastPinchDist / Math.max(1, dist);
-          this.desiredDistance = THREE.MathUtils.clamp(this.desiredDistance * factor, 6, 180);
+          if (this.lastPinchDist > 1) {
+            const factor = this.lastPinchDist / Math.max(1, dist);
+            this.desiredDistance = THREE.MathUtils.clamp(this.desiredDistance * factor, 6, 180);
+          }
+          this.panByScreenDelta(midX - this.lastPinchMidX, midY - this.lastPinchMidY);
+          this.lastPinchDist = dist;
+          this.lastPinchMidX = midX;
+          this.lastPinchMidY = midY;
+          return;
         }
-        this.panByScreenDelta(midX - this.lastPinchMidX, midY - this.lastPinchMidY);
-        this.lastPinchDist = dist;
-        this.lastPinchMidX = midX;
-        this.lastPinchMidY = midY;
+
+        if (
+          this.activePointers.size === 1 &&
+          e.pointerId === this.touchOrbitPointerId &&
+          !this.hadMultiTouch &&
+          this.allowSingleTouchOrbit
+        ) {
+          if (!this.touchOrbitActivated) {
+            if (Math.hypot(e.clientX - this.touchStartX, e.clientY - this.touchStartY) >= 8) {
+              this.touchOrbitActivated = true;
+              this.lastPointerX = e.clientX;
+              this.lastPointerY = e.clientY;
+              this.movedDuringDrag = true;
+            }
+            return;
+          }
+          const dx = e.clientX - this.lastPointerX;
+          const dy = e.clientY - this.lastPointerY;
+          this.lastPointerX = e.clientX;
+          this.lastPointerY = e.clientY;
+          this.desiredYaw -= dx * 0.0082;
+          this.desiredPitch = THREE.MathUtils.clamp(this.desiredPitch + dy * 0.0072, 0.08, 1.46);
+        }
         return;
       }
 
@@ -108,10 +159,27 @@ export class CameraController {
     });
 
     const endPointer = (e: PointerEvent) => {
-      this.activePointers.delete(e.pointerId);
-      if (this.activePointers.size < 2) {
-        this.lastPinchDist = 0;
+      if (e.pointerType === 'touch') {
+        this.activePointers.delete(e.pointerId);
+        if (this.activePointers.size === 2) {
+          const pts = Array.from(this.activePointers.values());
+          this.lastPinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+          this.lastPinchMidX = (pts[0].x + pts[1].x) * 0.5;
+          this.lastPinchMidY = (pts[0].y + pts[1].y) * 0.5;
+        } else if (this.activePointers.size < 2) {
+          this.lastPinchDist = 0;
+        }
+        if (this.activePointers.size === 0) {
+          this.touchOrbitPointerId = null;
+          this.touchOrbitActivated = false;
+          this.hadMultiTouch = false;
+        } else if (e.pointerId === this.touchOrbitPointerId) {
+          this.touchOrbitPointerId = null;
+          this.touchOrbitActivated = false;
+        }
+        return;
       }
+
       if (e.button === 2 || e.button === 1 || e.button === 0) {
         this.dragMode = 'none';
       }
@@ -145,6 +213,11 @@ export class CameraController {
     window.addEventListener('blur', () => {
       this.keys.clear();
       this.dragMode = 'none';
+      this.activePointers.clear();
+      this.lastPinchDist = 0;
+      this.touchOrbitPointerId = null;
+      this.touchOrbitActivated = false;
+      this.hadMultiTouch = false;
     });
   }
 

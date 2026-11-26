@@ -62,6 +62,15 @@ class BrickWorldApp {
   private lastHit: RayHit | null = null;
   private lastPlacement: { x: number; y: number; z: number; valid: boolean } | null = null;
 
+  // Touch interaction state (tap vs 1-finger orbit vs 2-finger pinch/pan)
+  private activeTouchIds = new Set<number>();
+  private touchPrimaryId: number | null = null;
+  private touchDownX = 0;
+  private touchDownY = 0;
+  private touchMoved = false;
+  private touchWasMulti = false;
+  private touchContinuousActive = false;
+
   // Custom stamps & Missions
   private customStamps: StampDef[] = [];
   private completedMissions = new Set<string>();
@@ -121,8 +130,28 @@ class BrickWorldApp {
       this.renderer.domElement
     );
 
+    this.registerDebugGetter();
     this.loadPersistentExtras();
     this.initWorldAndUI();
+  }
+
+  private registerDebugGetter() {
+    Object.defineProperty(window as unknown as Record<string, unknown>, '__brickDebug', {
+      configurable: true,
+      enumerable: false,
+      get: () => ({
+        yaw: this.tool === 'play' ? this.playCtrl.camYaw : this.camCtrl.yaw,
+        pitch: this.tool === 'play' ? this.playCtrl.camPitch : this.camCtrl.pitch,
+        distance: this.camCtrl.distance,
+        brickCount: this.world.getBrickCount(),
+        tool: this.tool,
+        playerPos: {
+          x: this.playCtrl.position.x,
+          y: this.playCtrl.position.y,
+          z: this.playCtrl.position.z,
+        },
+      }),
+    });
   }
 
   private loadPersistentExtras() {
@@ -292,6 +321,7 @@ class BrickWorldApp {
           this.syncHud();
         },
         onPlayJump: () => this.playCtrl.triggerMobileJump(),
+        onVirtualMove: (f, r) => this.playCtrl.setVirtualMove(f, r),
         getSaveSlots: () => this.world.listSaveSlots(),
         getCurrentWorldName: () => this.world.worldName,
         getCompletedMissions: () => this.completedMissions,
@@ -310,6 +340,44 @@ class BrickWorldApp {
     });
   }
 
+  private updatePointerNdc(clientX: number, clientY: number) {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointerNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointerNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+  }
+
+  private resetTouchState() {
+    this.activeTouchIds.clear();
+    this.touchPrimaryId = null;
+    this.touchMoved = false;
+    this.touchWasMulti = false;
+    this.touchContinuousActive = false;
+    this.isLeftDrawing = false;
+    this.lastPlacedKey = '';
+  }
+
+  private syncCameraTouchOrbit() {
+    const isContinuousTouchBrush =
+      this.continuousDraw && (this.tool === 'build' || this.tool === 'paint');
+    this.camCtrl.allowSingleTouchOrbit = !isContinuousTouchBrush;
+  }
+
+  private executeToolAction() {
+    if (this.tool === 'build') {
+      this.tryPlaceSingleBrick();
+    } else if (this.tool === 'delete') {
+      this.tryDeleteHoveredBrick();
+    } else if (this.tool === 'paint') {
+      this.tryPaintHoveredBrick();
+    } else if (this.tool === 'eyedropper') {
+      this.tryEyedropHoveredBrick();
+    } else if (this.tool === 'stamp') {
+      this.tryPlaceCurrentStamp();
+    } else if (this.tool === 'dynamite') {
+      this.tryTriggerDynamite();
+    }
+  }
+
   private bindInteractionEvents() {
     const dom = this.renderer.domElement;
 
@@ -322,17 +390,77 @@ class BrickWorldApp {
     dom.addEventListener('pointerenter', () => {
       this.pointerInside = true;
     });
-    dom.addEventListener('pointerleave', () => {
+    dom.addEventListener('pointerleave', (e) => {
+      if (e.pointerType === 'touch') return;
       this.pointerInside = false;
       this.isLeftDrawing = false;
       this.brickRenderer.hideGhost();
       this.brickRenderer.showHoverHighlight(null);
     });
 
+    // Track touch movement on window too so drags gliding over HUD still cancel taps
+    window.addEventListener('pointermove', (e) => {
+      if (e.pointerType !== 'touch' || !this.activeTouchIds.has(e.pointerId)) return;
+      if (this.activeTouchIds.size > 1) {
+        this.touchWasMulti = true;
+        this.isLeftDrawing = false;
+        this.touchContinuousActive = false;
+        this.brickRenderer.hideGhost();
+        this.brickRenderer.showHoverHighlight(null);
+        return;
+      }
+      if (
+        e.pointerId === this.touchPrimaryId &&
+        !this.touchMoved &&
+        Math.hypot(e.clientX - this.touchDownX, e.clientY - this.touchDownY) >= 10
+      ) {
+        this.touchMoved = true;
+        if (!this.touchContinuousActive) {
+          this.brickRenderer.hideGhost();
+          this.brickRenderer.showHoverHighlight(null);
+        }
+      }
+    });
+
     dom.addEventListener('pointermove', (e) => {
-      const rect = dom.getBoundingClientRect();
-      this.pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      this.pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      if (e.pointerType === 'touch') {
+        if (this.tool === 'play' || !this.activeTouchIds.has(e.pointerId)) return;
+        if (this.activeTouchIds.size > 1) {
+          this.touchWasMulti = true;
+          this.isLeftDrawing = false;
+          this.touchContinuousActive = false;
+          return;
+        }
+        if (
+          e.pointerId === this.touchPrimaryId &&
+          !this.touchMoved &&
+          Math.hypot(e.clientX - this.touchDownX, e.clientY - this.touchDownY) >= 10
+        ) {
+          this.touchMoved = true;
+          if (!this.touchContinuousActive) {
+            this.brickRenderer.hideGhost();
+            this.brickRenderer.showHoverHighlight(null);
+          }
+        }
+        if (
+          this.continuousDraw &&
+          !this.touchWasMulti &&
+          this.activeTouchIds.size === 1 &&
+          (this.tool === 'build' || this.tool === 'paint')
+        ) {
+          this.updatePointerNdc(e.clientX, e.clientY);
+          this.pointerInside = true;
+          this.updateHoverAndGhost();
+          if (this.tool === 'build') {
+            this.tryPlaceSingleBrick();
+          } else if (this.tool === 'paint') {
+            this.tryPaintHoveredBrick();
+          }
+        }
+        return;
+      }
+
+      this.updatePointerNdc(e.clientX, e.clientY);
       this.pointerInside = true;
 
       if (this.tool === 'play') return;
@@ -350,6 +478,47 @@ class BrickWorldApp {
 
     dom.addEventListener('pointerdown', (e) => {
       if (this.tool === 'play') return;
+
+      if (e.pointerType === 'touch') {
+        this.activeTouchIds.add(e.pointerId);
+
+        if (this.activeTouchIds.size > 1) {
+          this.touchWasMulti = true;
+          this.isLeftDrawing = false;
+          this.touchContinuousActive = false;
+          this.brickRenderer.hideGhost();
+          this.brickRenderer.showHoverHighlight(null);
+          return;
+        }
+
+        this.touchPrimaryId = e.pointerId;
+        this.touchDownX = e.clientX;
+        this.touchDownY = e.clientY;
+        this.touchMoved = false;
+        this.touchWasMulti = false;
+        this.touchContinuousActive = false;
+
+        this.updatePointerNdc(e.clientX, e.clientY);
+        this.pointerInside = true;
+
+        const isContinuousTool =
+          this.continuousDraw && (this.tool === 'build' || this.tool === 'paint');
+        if (isContinuousTool) {
+          this.updateHoverAndGhost();
+          this.isLeftDrawing = true;
+          this.touchContinuousActive = true;
+          this.lastPlacedKey = '';
+          if (this.tool === 'build') {
+            this.tryPlaceSingleBrick();
+          } else if (this.tool === 'paint') {
+            this.tryPaintHoveredBrick();
+          }
+        } else if (this.tool === 'build' || this.tool === 'stamp') {
+          this.updateHoverAndGhost();
+        }
+        return;
+      }
+
       if (e.button === 2) {
         this.rightDownX = e.clientX;
         this.rightDownY = e.clientY;
@@ -357,47 +526,76 @@ class BrickWorldApp {
       }
       if (e.button !== 0 || e.altKey) return; // Right/Alt drag is camera orbit
 
-      const rect = dom.getBoundingClientRect();
-      this.pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      this.pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      this.updatePointerNdc(e.clientX, e.clientY);
       this.pointerInside = true;
       this.updateHoverAndGhost();
 
       this.isLeftDrawing = true;
       this.lastPlacedKey = '';
-
-      if (this.tool === 'build') {
-        this.tryPlaceSingleBrick();
-      } else if (this.tool === 'delete') {
-        this.tryDeleteHoveredBrick();
-      } else if (this.tool === 'paint') {
-        this.tryPaintHoveredBrick();
-      } else if (this.tool === 'eyedropper') {
-        this.tryEyedropHoveredBrick();
-      } else if (this.tool === 'stamp') {
-        this.tryPlaceCurrentStamp();
-      } else if (this.tool === 'dynamite') {
-        this.tryTriggerDynamite();
-      }
+      this.executeToolAction();
     });
 
     dom.addEventListener('pointerup', (e) => {
+      if (e.pointerType === 'touch') {
+        if (this.tool !== 'play' && this.activeTouchIds.has(e.pointerId)) {
+          const isContinuousTool =
+            this.continuousDraw && (this.tool === 'build' || this.tool === 'paint');
+          if (
+            !this.touchMoved &&
+            !this.touchWasMulti &&
+            e.pointerId === this.touchPrimaryId &&
+            !isContinuousTool &&
+            !this.touchContinuousActive
+          ) {
+            this.updatePointerNdc(e.clientX, e.clientY);
+            this.pointerInside = true;
+            this.updateHoverAndGhost();
+            this.lastPlacedKey = '';
+            this.executeToolAction();
+          }
+        }
+        this.activeTouchIds.delete(e.pointerId);
+        if (this.activeTouchIds.size === 0) {
+          this.resetTouchState();
+          this.brickRenderer.hideGhost();
+          this.brickRenderer.showHoverHighlight(null);
+        } else if (e.pointerId === this.touchPrimaryId) {
+          this.touchPrimaryId = null;
+        }
+        return;
+      }
+
       // Quick right-click tap (no drag) in Build mode deletes the pointed brick!
       if (this.tool === 'build' && e.button === 2) {
         const moveDist = Math.hypot(e.clientX - this.rightDownX, e.clientY - this.rightDownY);
         if (moveDist < 4) {
-          const rect = dom.getBoundingClientRect();
-          this.pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-          this.pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+          this.updatePointerNdc(e.clientX, e.clientY);
           this.updateHoverAndGhost();
           this.tryDeleteHoveredBrick();
         }
       }
     });
 
-    window.addEventListener('pointerup', () => {
+    const endWindowPointer = (e: PointerEvent) => {
+      if (e.pointerType === 'touch') {
+        if (!this.activeTouchIds.has(e.pointerId)) return;
+        this.activeTouchIds.delete(e.pointerId);
+        if (this.activeTouchIds.size === 0) {
+          this.resetTouchState();
+          this.brickRenderer.hideGhost();
+          this.brickRenderer.showHoverHighlight(null);
+        } else if (e.pointerId === this.touchPrimaryId) {
+          this.touchPrimaryId = null;
+        }
+        return;
+      }
       this.isLeftDrawing = false;
       this.lastPlacedKey = '';
+    };
+    window.addEventListener('pointerup', endWindowPointer);
+    window.addEventListener('pointercancel', endWindowPointer);
+    window.addEventListener('blur', () => {
+      this.resetTouchState();
     });
 
     // Keyboard shortcuts!
@@ -468,6 +666,7 @@ class BrickWorldApp {
     }
 
     this.tool = nextTool;
+    this.resetTouchState();
     this.brickRenderer.hideGhost();
     this.brickRenderer.showHoverHighlight(null);
 
@@ -893,6 +1092,7 @@ class BrickWorldApp {
   }
 
   private syncHud() {
+    this.syncCameraTouchOrbit();
     this.hud.syncState({
       tool: this.tool,
       partId: this.selectedPartId,

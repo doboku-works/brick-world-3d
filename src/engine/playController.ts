@@ -24,8 +24,8 @@ export class PlayController {
   public position = new THREE.Vector3(64, 0, 68);
   private velocity = new THREE.Vector3();
   public heading = Math.PI; // facing -Z toward starter village
-  private camYaw = Math.PI;
-  private camPitch = 0.34;
+  public camYaw = Math.PI;
+  public camPitch = 0.34;
   private onGround = true;
   private walkPhase = 0;
 
@@ -44,8 +44,11 @@ export class PlayController {
   // Input state
   private keys = new Set<string>();
   private isDraggingLook = false;
+  private lookPointerId: number | null = null;
   private lastX = 0;
   private lastY = 0;
+  private virtualForward = 0;
+  private virtualRight = 0;
 
   constructor(
     scene: THREE.Scene,
@@ -283,25 +286,42 @@ export class PlayController {
 
     this.domElement.addEventListener('pointerdown', (e) => {
       if (!this.active) return;
-      if (e.button === 0 || e.button === 2) {
-        this.isDraggingLook = true;
-        this.lastX = e.clientX;
-        this.lastY = e.clientY;
-      }
+      const isTouch = e.pointerType === 'touch';
+      if (!isTouch && e.button !== 0 && e.button !== 2) return;
+      if (this.lookPointerId !== null) return;
+      this.isDraggingLook = true;
+      this.lookPointerId = e.pointerId;
+      this.lastX = e.clientX;
+      this.lastY = e.clientY;
     });
 
     window.addEventListener('pointermove', (e) => {
-      if (!this.active || !this.isDraggingLook) return;
+      if (!this.active || !this.isDraggingLook || e.pointerId !== this.lookPointerId) return;
       const dx = e.clientX - this.lastX;
       const dy = e.clientY - this.lastY;
       this.lastX = e.clientX;
       this.lastY = e.clientY;
-      this.camYaw -= dx * 0.0065;
-      this.camPitch = THREE.MathUtils.clamp(this.camPitch + dy * 0.005, -0.25, 1.15);
+      const yawSens = e.pointerType === 'touch' ? 0.008 : 0.0065;
+      const pitchSens = e.pointerType === 'touch' ? 0.0062 : 0.005;
+      this.camYaw -= dx * yawSens;
+      this.camPitch = THREE.MathUtils.clamp(this.camPitch + dy * pitchSens, -0.25, 1.15);
     });
 
-    window.addEventListener('pointerup', () => {
+    const endLook = (e: PointerEvent) => {
+      if (e.pointerId === this.lookPointerId) {
+        this.isDraggingLook = false;
+        this.lookPointerId = null;
+      }
+    };
+    window.addEventListener('pointerup', endLook);
+    window.addEventListener('pointercancel', endLook);
+
+    window.addEventListener('blur', () => {
+      this.keys.clear();
       this.isDraggingLook = false;
+      this.lookPointerId = null;
+      this.virtualForward = 0;
+      this.virtualRight = 0;
     });
   }
 
@@ -309,6 +329,10 @@ export class PlayController {
     this.active = true;
     this.vehicleMode = vehicle;
     this.keys.clear();
+    this.virtualForward = 0;
+    this.virtualRight = 0;
+    this.isDraggingLook = false;
+    this.lookPointerId = null;
 
     // Smart open-plaza search: prefer a wide 5x5 open ground spot so the avatar
     // & third-person camera have a gorgeous unobstructed view of the build!
@@ -398,7 +422,15 @@ export class PlayController {
     this.active = false;
     this.keys.clear();
     this.isDraggingLook = false;
+    this.lookPointerId = null;
+    this.virtualForward = 0;
+    this.virtualRight = 0;
     this.playerRoot.visible = false;
+  }
+
+  public setVirtualMove(forward: number, right: number) {
+    this.virtualForward = THREE.MathUtils.clamp(forward, -1, 1);
+    this.virtualRight = THREE.MathUtils.clamp(right, -1, 1);
   }
 
   public setVehicleMode(mode: PlayVehicleMode) {
@@ -448,13 +480,16 @@ export class PlayController {
     if (this.keys.has('KeyQ')) this.camYaw += 2.1 * clampedDt;
     if (this.keys.has('KeyE')) this.camYaw -= 2.1 * clampedDt;
 
-    // Input direction relative to camera yaw
-    let inputForward = 0;
-    let inputRight = 0;
-    if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) inputForward += 1;
-    if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) inputForward -= 1;
-    if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) inputRight += 1;
-    if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) inputRight -= 1;
+    // Input direction relative to camera yaw (keyboard + virtual joystick combined)
+    let keyForward = 0;
+    let keyRight = 0;
+    if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) keyForward += 1;
+    if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) keyForward -= 1;
+    if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) keyRight += 1;
+    if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) keyRight -= 1;
+
+    const inputForward = THREE.MathUtils.clamp(keyForward + this.virtualForward, -1, 1);
+    const inputRight = THREE.MathUtils.clamp(keyRight + this.virtualRight, -1, 1);
 
     const isCar = this.vehicleMode === 'car';
     const maxSpeed = isCar ? 20 : 10.5;
@@ -470,6 +505,7 @@ export class PlayController {
 
     const moving = moveDir.lengthSq() > 0.01;
     if (moving) {
+      const magnitude = Math.min(1, moveDir.length());
       moveDir.normalize();
       const targetHeading = Math.atan2(moveDir.x, moveDir.z);
       // Shortest angle interpolation
@@ -487,8 +523,9 @@ export class PlayController {
       }
 
       const accel = isCar ? 24 : 36;
-      this.velocity.x = THREE.MathUtils.lerp(this.velocity.x, moveDir.x * maxSpeed, Math.min(1, accel * clampedDt * 0.25));
-      this.velocity.z = THREE.MathUtils.lerp(this.velocity.z, moveDir.z * maxSpeed, Math.min(1, accel * clampedDt * 0.25));
+      const targetSpeed = maxSpeed * magnitude;
+      this.velocity.x = THREE.MathUtils.lerp(this.velocity.x, moveDir.x * targetSpeed, Math.min(1, accel * clampedDt * 0.25));
+      this.velocity.z = THREE.MathUtils.lerp(this.velocity.z, moveDir.z * targetSpeed, Math.min(1, accel * clampedDt * 0.25));
     } else {
       const drag = Math.exp(-(isCar ? 5 : 11) * clampedDt);
       this.velocity.x *= drag;

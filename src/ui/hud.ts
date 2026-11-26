@@ -44,6 +44,7 @@ export interface HudCallbacks {
   onPlayVehicleChange: (mode: PlayVehicleMode) => void;
   onPlayCameraToggle: () => void;
   onPlayJump: () => void;
+  onVirtualMove?: (forward: number, right: number) => void;
   getSaveSlots: () => SaveSlotSummary[];
   getCurrentWorldName: () => string;
   getCompletedMissions: () => Set<string>;
@@ -96,6 +97,16 @@ export class GameHUD {
   private quickHintEl!: HTMLElement;
   private toastContainer!: HTMLElement;
   private minimapCanvas!: HTMLCanvasElement;
+  private rightCornerEl!: HTMLElement;
+  private minimapToggleBtn!: HTMLButtonElement;
+  private minimapMobileOpen = false;
+  private touchPlayControlsEl!: HTMLElement;
+  private joystickBaseEl!: HTMLElement;
+  private joystickKnobEl!: HTMLElement;
+  private touchActionBtn!: HTMLButtonElement;
+  private touchActionIconEl!: HTMLElement;
+  private touchActionLabelEl!: HTMLElement;
+  private joystickPointerId: number | null = null;
   private modalBackdrop!: HTMLElement;
   private modalCard!: HTMLElement;
   private activeModal: 'none' | 'world' | 'missions' | 'help' = 'none';
@@ -107,6 +118,15 @@ export class GameHUD {
 
     this.buildShell();
     this.renderDock();
+
+    const onViewportChange = () => {
+      this.syncTouchPlayControls();
+    };
+    window.addEventListener('resize', onViewportChange);
+    window.addEventListener('orientationchange', onViewportChange);
+    window.addEventListener('blur', () => {
+      if (this.joystickPointerId !== null) this.resetJoystick();
+    });
   }
 
   private el<K extends keyof HTMLElementTagNameMap>(
@@ -138,7 +158,7 @@ export class GameHUD {
     topBar.append(brand);
 
     // Main Tool Group
-    const toolGroup = this.el('div', 'bar-group pointer-on');
+    const toolGroup = this.el('div', 'bar-group tool-group pointer-on');
     const tools: Array<{ id: ToolMode; icon: string; label: string; extraClass?: string }> = [
       { id: 'build', icon: '🧱', label: 'おく' },
       { id: 'delete', icon: '🔨', label: 'けす', extraClass: 'btn-danger' },
@@ -159,7 +179,7 @@ export class GameHUD {
     topBar.append(toolGroup);
 
     // Quick Action Group
-    const actionGroup = this.el('div', 'bar-group pointer-on');
+    const actionGroup = this.el('div', 'bar-group action-group pointer-on');
 
     this.undoBtn = this.el('button', 'btn btn-small');
     this.undoBtn.title = 'ひとつ もどす (Ctrl+Z)';
@@ -208,11 +228,11 @@ export class GameHUD {
     actionGroup.append(
       this.undoBtn,
       this.redoBtn,
-      rotateBtn,
-      this.contBtn,
-      this.timeBtn,
-      missionBtn,
       worldBtn,
+      rotateBtn,
+      this.timeBtn,
+      this.contBtn,
+      missionBtn,
       this.muteBtn,
       helpBtn
     );
@@ -233,8 +253,18 @@ export class GameHUD {
     this.dockContainer = this.el('div', 'bottom-dock pointer-on');
     this.root.append(this.dockContainer);
 
-    // 4) Right Corner: Camera buttons + Giant 128x128 Minimap
-    const rightCorner = this.el('div', 'right-corner pointer-on');
+    // 5) Right Corner: Mobile Toggle + Camera buttons + Giant 128x128 Minimap
+    this.rightCornerEl = this.el('div', 'right-corner pointer-on');
+
+    this.minimapToggleBtn = this.el('button', 'minimap-toggle-btn', '🗺️');
+    this.minimapToggleBtn.type = 'button';
+    this.minimapToggleBtn.title = 'マップ・カメラを ひらく / とじる';
+    this.minimapToggleBtn.setAttribute('aria-label', 'マップ・カメラを ひらく / とじる');
+    this.minimapToggleBtn.addEventListener('click', () => {
+      this.minimapMobileOpen = !this.minimapMobileOpen;
+      this.syncRightCornerState();
+    });
+    this.rightCornerEl.append(this.minimapToggleBtn);
 
     const camPad = this.el('div', 'cam-pad');
     const makeCamBtn = (text: string, title: string, onClick: () => void) => {
@@ -252,10 +282,15 @@ export class GameHUD {
       makeCamBtn('🌐', 'せかい ぜんたいを みる', () => this.cb.onCameraOverview()),
       makeCamBtn('🏠', 'まん中に もどる', () => this.cb.onCameraReset())
     );
-    rightCorner.append(camPad);
+    this.rightCornerEl.append(camPad);
 
     const mmWrap = this.el('div', 'minimap-wrap');
-    mmWrap.append(this.el('div', 'minimap-title', '🗺️ 128×128 マップ（クリックでいどう）'));
+    const mmTitle = this.el('div', 'minimap-title');
+    mmTitle.append(
+      document.createTextNode('🗺️ 128×128 マップ'),
+      this.el('span', 'minimap-title-sub', '（クリックでいどう）')
+    );
+    mmWrap.append(mmTitle);
     this.minimapCanvas = this.el('canvas');
     this.minimapCanvas.id = 'minimap-canvas';
     this.minimapCanvas.width = 128;
@@ -267,10 +302,14 @@ export class GameHUD {
       this.cb.onMinimapClick(nx, nz);
     });
     mmWrap.append(this.minimapCanvas);
-    rightCorner.append(mmWrap);
-    this.root.append(rightCorner);
+    this.rightCornerEl.append(mmWrap);
+    this.root.append(this.rightCornerEl);
 
-    // 6) Modal Backdrop
+    // 6) Touch / Mobile Play Controls (Virtual Joystick + Big Jump/Horn Button)
+    this.buildTouchPlayControls();
+    this.root.append(this.touchPlayControlsEl);
+
+    // 7) Modal Backdrop
     this.modalBackdrop = this.el('div', 'modal-backdrop hidden pointer-on');
     this.modalCard = this.el('div', 'modal-card');
     this.modalBackdrop.append(this.modalCard);
@@ -279,7 +318,180 @@ export class GameHUD {
     });
     this.root.append(this.modalBackdrop);
 
+    this.syncRightCornerState();
     this.syncTopBarState();
+    this.syncTouchPlayControls();
+  }
+
+  private syncRightCornerState() {
+    const collapsed = !this.minimapMobileOpen;
+    this.rightCornerEl.classList.toggle('mobile-collapsed', collapsed);
+    this.root.classList.toggle('minimap-open-mobile', !collapsed);
+    this.minimapToggleBtn.textContent = collapsed ? '🗺️' : '🗺️ ✖';
+    this.minimapToggleBtn.classList.toggle('open', !collapsed);
+    this.minimapToggleBtn.setAttribute('aria-expanded', String(!collapsed));
+  }
+
+  private buildTouchPlayControls() {
+    this.touchPlayControlsEl = this.el('div', 'touch-play-controls hidden');
+
+    // Left: Virtual Joystick
+    this.joystickBaseEl = this.el('div', 'virtual-joystick pointer-on');
+    this.joystickBaseEl.setAttribute('role', 'application');
+    this.joystickBaseEl.setAttribute('aria-label', 'いどう パッド');
+
+    const arrows: Array<[string, string]> = [
+      ['vj-dir vj-up', '▲'],
+      ['vj-dir vj-down', '▼'],
+      ['vj-dir vj-left', '◀'],
+      ['vj-dir vj-right', '▶'],
+    ];
+    for (const [cls, symbol] of arrows) {
+      const a = this.el('span', cls, symbol);
+      a.setAttribute('aria-hidden', 'true');
+      this.joystickBaseEl.append(a);
+    }
+
+    this.joystickKnobEl = this.el('div', 'virtual-joystick-knob');
+    this.joystickBaseEl.append(this.joystickKnobEl);
+
+    this.joystickBaseEl.addEventListener('pointerdown', (e: PointerEvent) => {
+      if (this.joystickPointerId !== null) return;
+      e.stopPropagation();
+      e.preventDefault();
+      this.joystickPointerId = e.pointerId;
+      try {
+        this.joystickBaseEl.setPointerCapture(e.pointerId);
+      } catch {
+        // Ignore if capture is unsupported in synthetic events
+      }
+      this.joystickBaseEl.classList.add('active');
+      this.updateJoystickFromPointer(e.clientX, e.clientY);
+    });
+
+    this.joystickBaseEl.addEventListener('pointermove', (e: PointerEvent) => {
+      if (this.joystickPointerId !== e.pointerId) return;
+      e.stopPropagation();
+      e.preventDefault();
+      this.updateJoystickFromPointer(e.clientX, e.clientY);
+    });
+
+    const onJoystickRelease = (e: PointerEvent) => {
+      if (this.joystickPointerId !== e.pointerId) return;
+      e.stopPropagation();
+      this.resetJoystick();
+    };
+    this.joystickBaseEl.addEventListener('pointerup', onJoystickRelease);
+    this.joystickBaseEl.addEventListener('pointercancel', onJoystickRelease);
+    this.joystickBaseEl.addEventListener('lostpointercapture', onJoystickRelease);
+
+    // Right: Big Jump / Horn Button
+    this.touchActionBtn = this.el('button', 'touch-action-btn pointer-on');
+    this.touchActionBtn.type = 'button';
+    this.touchActionIconEl = this.el('span', 'touch-action-icon', '⬆️');
+    this.touchActionLabelEl = this.el('span', 'touch-action-label', 'ジャンプ');
+    this.touchActionBtn.append(this.touchActionIconEl, this.touchActionLabelEl);
+
+    this.touchActionBtn.addEventListener('pointerdown', (e: PointerEvent) => {
+      e.stopPropagation();
+      e.preventDefault();
+      this.touchActionBtn.classList.add('pressed');
+      this.cb.onPlayJump();
+    });
+    const clearActionPress = (e: PointerEvent) => {
+      e.stopPropagation();
+      this.touchActionBtn.classList.remove('pressed');
+    };
+    this.touchActionBtn.addEventListener('pointerup', clearActionPress);
+    this.touchActionBtn.addEventListener('pointercancel', clearActionPress);
+    this.touchActionBtn.addEventListener('pointerleave', clearActionPress);
+    this.touchActionBtn.addEventListener('click', (e) => e.stopPropagation());
+
+    this.touchPlayControlsEl.append(this.joystickBaseEl, this.touchActionBtn);
+  }
+
+  private updateJoystickFromPointer(clientX: number, clientY: number) {
+    const rect = this.joystickBaseEl.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const knobSize = this.joystickKnobEl.offsetWidth || 46;
+    const maxRadius = Math.max(12, (rect.width - knobSize) / 2);
+
+    let dx = clientX - cx;
+    let dy = clientY - cy;
+    const dist = Math.hypot(dx, dy);
+    if (dist > maxRadius) {
+      const scale = maxRadius / dist;
+      dx *= scale;
+      dy *= scale;
+    }
+
+    this.joystickKnobEl.style.transform = `translate3d(${dx.toFixed(1)}px, ${dy.toFixed(1)}px, 0)`;
+
+    const normDist = Math.min(1, dist / maxRadius);
+    if (normDist < 0.08) {
+      this.cb.onVirtualMove?.(0, 0);
+      return;
+    }
+
+    const right = dx / maxRadius;
+    const forward = -dy / maxRadius;
+    this.cb.onVirtualMove?.(forward, right);
+  }
+
+  private resetJoystick() {
+    if (this.joystickPointerId !== null) {
+      try {
+        if (this.joystickBaseEl.hasPointerCapture(this.joystickPointerId)) {
+          this.joystickBaseEl.releasePointerCapture(this.joystickPointerId);
+        }
+      } catch {
+        // Ignore release errors
+      }
+    }
+    this.joystickPointerId = null;
+    this.joystickBaseEl.classList.remove('active');
+    this.joystickKnobEl.style.transform = 'translate3d(0px, 0px, 0px)';
+    this.cb.onVirtualMove?.(0, 0);
+  }
+
+  private shouldShowTouchPlayControls(): boolean {
+    if (this.currentTool !== 'play') return false;
+    const coarse = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+    const compact = window.innerWidth <= 960 || window.innerHeight <= 520;
+    return coarse || compact;
+  }
+
+  private syncTouchPlayControls() {
+    const show = this.shouldShowTouchPlayControls();
+    this.touchPlayControlsEl.classList.toggle('hidden', !show);
+
+    if (!show) {
+      if (this.joystickPointerId !== null) {
+        this.resetJoystick();
+      }
+      return;
+    }
+
+    const isCar = this.playVehicle === 'car';
+    this.touchActionBtn.classList.toggle('is-car', isCar);
+    this.touchActionIconEl.textContent = isCar ? '📯' : '⬆️';
+    this.touchActionLabelEl.textContent = isCar ? 'プップー' : 'ジャンプ';
+    this.touchActionBtn.setAttribute('aria-label', isCar ? 'クラクション' : 'ジャンプ');
+
+    requestAnimationFrame(() => this.positionTouchPlayControls());
+  }
+
+  private positionTouchPlayControls() {
+    if (!this.touchPlayControlsEl || this.touchPlayControlsEl.classList.contains('hidden')) return;
+    const dockRect = this.dockContainer.getBoundingClientRect();
+    if (dockRect.height > 0) {
+      const dockFromBottom = Math.max(0, window.innerHeight - dockRect.top);
+      const desiredBottom = Math.max(60, Math.ceil(dockFromBottom + 12));
+      this.touchPlayControlsEl.style.setProperty('--play-controls-bottom', `${desiredBottom}px`);
+    } else {
+      this.touchPlayControlsEl.style.removeProperty('--play-controls-bottom');
+    }
   }
 
   public syncState(state: {
@@ -339,6 +551,8 @@ export class GameHUD {
     if (toolChanged || smashedChanged || playChanged || partChanged || colorChanged || stampChanged) {
       this.renderDock();
     }
+
+    this.syncTouchPlayControls();
   }
 
   private syncTopBarState() {
@@ -368,9 +582,9 @@ export class GameHUD {
     // Special Mode: Play / Explore
     if (this.currentTool === 'play') {
       const panel = this.el('div', 'dock-panel');
-      const banner = this.el('div', 'mode-banner');
+      const banner = this.el('div', 'mode-banner play-mode-banner');
 
-      const left = this.el('div');
+      const left = this.el('div', 'mode-banner-info');
       left.append(
         this.el(
           'div',
@@ -381,17 +595,23 @@ export class GameHUD {
         ),
         this.el(
           'div',
-          'mode-banner-sub',
+          'mode-banner-sub play-hint-desktop',
           'WASD / やじるしキー で いどう・ドラッグで みまわし・スペースで ジャンプ / プップー！'
+        ),
+        this.el(
+          'div',
+          'mode-banner-sub play-hint-mobile',
+          'ひだりパッドで うごく・がめんドラッグで みまわす'
         )
       );
 
-      const controls = this.el('div', 'slot-actions');
+      const controls = this.el('div', 'slot-actions play-banner-actions');
       const walkBtn = this.el(
         'button',
         `btn ${this.playVehicle === 'walk' ? 'active' : ''}`,
         '🚶 あるく'
       );
+      walkBtn.type = 'button';
       walkBtn.addEventListener('click', () => this.cb.onPlayVehicleChange('walk'));
 
       const carBtn = this.el(
@@ -399,6 +619,7 @@ export class GameHUD {
         `btn ${this.playVehicle === 'car' ? 'active' : ''}`,
         '🏎️ くるまにのる'
       );
+      carBtn.type = 'button';
       carBtn.addEventListener('click', () => this.cb.onPlayVehicleChange('car'));
 
       const viewBtn = this.el(
@@ -406,22 +627,26 @@ export class GameHUD {
         'btn',
         this.playCamera === 'third' ? '👀 1にんしょうにする' : '👀 3にんしょうにする'
       );
+      viewBtn.type = 'button';
       viewBtn.addEventListener('click', () => this.cb.onPlayCameraToggle());
 
       const jumpBtn = this.el(
         'button',
-        'btn',
+        'btn play-dock-jump-btn',
         this.playVehicle === 'car' ? '📯 プップー！' : '⬆️ ジャンプ！'
       );
+      jumpBtn.type = 'button';
       jumpBtn.addEventListener('click', () => this.cb.onPlayJump());
 
       const backBtn = this.el('button', 'btn btn-play', '🧱 つくるに もどる');
+      backBtn.type = 'button';
       backBtn.addEventListener('click', () => this.cb.onSelectTool('build'));
 
       controls.append(walkBtn, carBtn, viewBtn, jumpBtn, backBtn);
       banner.append(left, controls);
       panel.append(banner);
       this.dockContainer.append(panel);
+      requestAnimationFrame(() => this.positionTouchPlayControls());
       return;
     }
 
@@ -429,7 +654,7 @@ export class GameHUD {
     if (this.currentTool === 'dynamite') {
       const panel = this.el('div', 'dock-panel');
       const banner = this.el('div', 'mode-banner');
-      const left = this.el('div');
+      const left = this.el('div', 'mode-banner-info');
       left.append(
         this.el('div', 'mode-banner-text', '💣 テストくずし（ドカーン！モード）'),
         this.el(
@@ -438,11 +663,13 @@ export class GameHUD {
           'ブロックを クリックして ドカーンと あそぼう！だいじな 作品は ぜんぶ まきもどしで もとどおり！'
         )
       );
-      const right = this.el('div', 'slot-actions');
+      const right = this.el('div', 'slot-actions mode-banner-actions');
       const rewindBtn = this.el('button', 'btn btn-play', '✨ まきもどして もとにもどす！');
+      rewindBtn.type = 'button';
       rewindBtn.disabled = !this.isSmashed;
       rewindBtn.addEventListener('click', () => this.cb.onRewindSmash());
       const doneBtn = this.el('button', 'btn', '🧱 つくるに もどる');
+      doneBtn.type = 'button';
       doneBtn.addEventListener('click', () => this.cb.onSelectTool('build'));
       right.append(rewindBtn, doneBtn);
       banner.append(left, right);
@@ -454,12 +681,16 @@ export class GameHUD {
     // Special Mode: Stamp Palette!
     if (this.currentTool === 'stamp') {
       const panel = this.el('div', 'dock-panel');
-      const header = this.el('div', 'dock-header-row');
-      header.append(
-        this.el('div', 'mode-banner-text', '🏗️ かんせい はんこ（ポンッとおいて じゆうに かいぞうできるよ！）')
+      const header = this.el('div', 'dock-header-row stamp-header-row');
+      const stampTitle = this.el('div', 'mode-banner-text');
+      stampTitle.append(
+        document.createTextNode('🏗️ かんせい はんこ'),
+        this.el('span', 'stamp-title-sub', '（ポンッとおいて じゆうに かいぞうできるよ！）')
       );
+      header.append(stampTitle);
       const rightBtns = this.el('div', 'slot-actions');
       const makeCustomBtn = this.el('button', 'btn btn-small', '⭐ いまの作品を はんこにする');
+      makeCustomBtn.type = 'button';
       makeCustomBtn.addEventListener('click', () => this.cb.onCreateCustomStamp());
       rightBtns.append(makeCustomBtn);
       header.append(rightBtns);
@@ -490,7 +721,7 @@ export class GameHUD {
     // Standard Builder / Paint / Delete / Eyedropper Dock
     // 1) Color Swatch Bar (always handy for build & paint)
     if (this.currentTool === 'build' || this.currentTool === 'paint') {
-      const colorPanel = this.el('div', 'dock-panel');
+      const colorPanel = this.el('div', 'dock-panel color-dock-panel');
       const colorBar = this.el('div', 'color-bar');
       const activeCol = getColorDef(this.currentColorId);
       colorBar.append(this.el('span', 'selected-color-name', `🎨 ${activeCol.name}`));
@@ -533,10 +764,19 @@ export class GameHUD {
         tabs.append(tab);
       }
 
-      const collapseBtn = this.el(
-        'button',
-        'btn btn-small',
-        this.dockCollapsed ? '▲ パーツをひらく' : '▼ しまっておく'
+      const collapseBtn = this.el('button', 'btn btn-small dock-collapse-btn');
+      collapseBtn.type = 'button';
+      collapseBtn.append(
+        this.el(
+          'span',
+          'collapse-label-desktop',
+          this.dockCollapsed ? '▲ パーツをひらく' : '▼ しまっておく'
+        ),
+        this.el(
+          'span',
+          'collapse-label-mobile',
+          this.dockCollapsed ? '▲ ひらく' : '▼ とじる'
+        )
       );
       collapseBtn.addEventListener('click', () => {
         this.dockCollapsed = !this.dockCollapsed;
@@ -646,6 +886,9 @@ export class GameHUD {
   // ==================== Modals ====================
 
   public openModal(kind: 'world' | 'missions' | 'help') {
+    if (this.joystickPointerId !== null) {
+      this.resetJoystick();
+    }
     this.activeModal = kind;
     this.modalBackdrop.classList.remove('hidden');
     this.renderModalContent();
@@ -785,7 +1028,7 @@ export class GameHUD {
 
     // 4) Local Save Slots (100% browser local, safe & private)
     const secSlots = this.el('div', 'modal-section');
-    secSlots.append(this.el('h3', '', '💿 ワールドほぞん（このPCのなかに あんぜんに ほぞんされます）'));
+    secSlots.append(this.el('h3', '', '💿 ワールドほぞん（このたんまつの なかに あんぜんに ほぞんされます）'));
 
     const nameInput = this.el('input', 'world-name-input');
     nameInput.type = 'text';
@@ -862,23 +1105,23 @@ export class GameHUD {
     const items: Array<[string, string]> = [
       [
         '🧱 ブロックを おく',
-        'したの パレットから かたちと いろを えらんで ひだりクリック！ Rキーか「まわす」ボタンで 90ど かいてん できます。',
+        'したの パレットから かたちと いろを えらんで クリック（スマホは タップ）！ Rキーか「まわす」ボタンで 90ど かいてん できます。',
       ],
       [
-        '✨ れんぞくおき',
-        'うえの「れんぞく」を ONにする（または Shiftをおしながらドラッグ）と、かべや みちを いっきに ならべられます！',
+        '📱 スマホ・タブレット操作',
+        '1本指ドラッグ：カメラかいてん ／ タップ：ブロックをおく ／ 2本指：ズーム・いどう！みぎの 🗺️ボタンで マップと カメラボタンを ひらけます。',
       ],
       [
-        '🎥 カメラの うごかし方',
+        '🎥 カメラの うごかし方（PC）',
         'みぎクリックしながら ドラッグで ぐるぐるかいてん！ホイールで ズーム、WASDか やじるしキーで ひろいせかいを いどうできます。みぎ下の マップクリックでも とべます！',
       ],
       [
-        '🏗️ かんせい はんこ',
-        'おうち・おしろ・パトカー・ロケット・ロボなどを ワンクリックで おけます！おいたあとは 1こずつ じゆうに かいぞう できます。',
+        '✨ れんぞくおき ＆ はんこ',
+        'うえの「れんぞく」を ONにすると かべや みちを いっきに ならべられます！「はんこ」なら おうちや パトカー・ロケットを ワンタップで おけます。',
       ],
       [
         '🚶 あそぶ・ドライブ',
-        '「あそぶ！」ボタンで ブロックにんぎょうや くるまに なって、じぶんが つくった まちのなかを ぼうけん できます！',
+        '「あそぶ！」で ブロックにんぎょうや くるまに なって ぼうけん！PCは WASD＋スペース、スマホ・タブレットは ひだりパッドで うごいて みぎボタンで ジャンプ／クラクション！',
       ],
       [
         '💣 ドカーン＆まきもどし',
@@ -896,7 +1139,7 @@ export class GameHUD {
     const safetyNote = this.el(
       'p',
       'mode-banner-sub',
-      '🔒 あんぜん設計：インターネットへの 送信・広告・課金は いっさいありません。つくった作品は このパソコンのなかに じどうで ほぞんされます。'
+      '🔒 あんぜん設計：インターネットへの 送信・広告・課金は いっさいありません。つくった作品は このたんまつの なかに じどうで ほぞんされます。'
     );
     safetyNote.style.marginTop = '14px';
     this.modalCard.append(safetyNote);
